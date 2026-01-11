@@ -239,4 +239,81 @@ def main():
     threading.Thread(target=start_health_check_server, daemon=True).start()
 
     start_time = datetime.now()
-    logger.info("=" *
+    logger.info("=" * 60)
+    logger.info("🚀 HAJIMI KING STARTING")
+    logger.info("=" * 60)
+
+    if not Config.check() or not file_manager.check():
+        logger.info("❌ Pre-check failed. Exiting...")
+        sys.exit(1)
+
+    search_queries = file_manager.get_search_queries()
+    logger.info(f"🔑 Tokens: {len(Config.GITHUB_TOKENS)} | 🔍 Queries: {len(search_queries)}")
+
+    total_keys_found, total_rate_limited_keys, loop_count = 0, 0, 0
+
+    while True:
+        try:
+            loop_count += 1
+            logger.info(f"🔄 Loop #{loop_count} - {datetime.now().strftime('%H:%M:%S')}")
+            query_count, loop_processed_files = 0, 0
+            reset_skip_stats()
+
+            for i, q in enumerate(search_queries, 1):
+                normalized_q = normalize_query(q)
+                if normalized_q in checkpoint.processed_queries: continue
+
+                res = github_utils.search_for_keys(q)
+                if res and "items" in res:
+                    items = res["items"]
+                    if items:
+                        query_valid_keys, query_rate_limited_keys, query_processed = 0, 0, 0
+                        for item_index, item in enumerate(items, 1):
+                            if item_index % 20 == 0:
+                                file_manager.save_checkpoint(checkpoint)
+                                file_manager.update_dynamic_filenames()
+
+                            should_skip, skip_reason = should_skip_item(item, checkpoint)
+                            if should_skip: continue
+
+                            valid_count, rate_limited_count = process_item(item)
+                            query_valid_keys += valid_count
+                            query_rate_limited_keys += rate_limited_count
+                            query_processed += 1
+                            checkpoint.add_scanned_sha(item.get("sha"))
+                            loop_processed_files += 1
+
+                        total_keys_found += query_valid_keys
+                        total_rate_limited_keys += query_rate_limited_keys
+                        logger.info(f"✅ Query {i}/{len(search_queries)} complete")
+
+                checkpoint.add_processed_query(normalized_q)
+                query_count += 1
+                checkpoint.update_scan_time()
+                file_manager.save_checkpoint(checkpoint)
+                
+                if query_count % 5 == 0: time.sleep(1)
+
+            logger.info(f"🏁 Loop #{loop_count} complete | Total Valid: {total_keys_found}")
+            
+            # 检查每小时汇总
+            if time.time() - LAST_TG_SEND_TIME >= 3600:
+                logger.info("🕒 Checking for hourly Telegram summary...")
+                send_telegram_summary()
+
+            time.sleep(10)
+
+        except KeyboardInterrupt:
+            sync_utils.shutdown()
+            break
+        except Exception as e:
+            logger.error(f"💥 Unexpected error: {e}")
+            time.sleep(10)
+            continue
+
+def reset_skip_stats():
+    global skip_stats
+    skip_stats = {"time_filter": 0, "sha_duplicate": 0, "age_filter": 0, "doc_filter": 0}
+
+if __name__ == "__main__":
+    main()
